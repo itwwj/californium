@@ -24,6 +24,7 @@ import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
 import java.lang.management.OperatingSystemMXBean;
 import java.lang.management.ThreadMXBean;
+import java.net.InetSocketAddress;
 import java.net.SocketException;
 import java.net.URI;
 import java.util.ArrayList;
@@ -31,13 +32,13 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-
-import org.eclipse.californium.elements.util.ExecutorsUtil;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 import org.eclipse.californium.core.coap.CoAP;
+import org.eclipse.californium.core.network.CoapEndpoint;
 import org.eclipse.californium.core.network.Endpoint;
+import org.eclipse.californium.core.network.EndpointContextMatcherFactory.MatcherMode;
 import org.eclipse.californium.core.network.EndpointObserver;
 import org.eclipse.californium.core.network.MessagePostProcessInterceptors;
 import org.eclipse.californium.core.network.config.NetworkConfig;
@@ -46,6 +47,8 @@ import org.eclipse.californium.core.network.config.NetworkConfigDefaultHandler;
 import org.eclipse.californium.core.network.interceptors.AnonymizedOriginTracer;
 import org.eclipse.californium.core.network.interceptors.HealthStatisticLogger;
 import org.eclipse.californium.core.network.interceptors.MessageTracer;
+import org.eclipse.californium.elements.PrincipalEndpointContextMatcher;
+import org.eclipse.californium.elements.util.ExecutorsUtil;
 import org.eclipse.californium.elements.util.NamedThreadFactory;
 import org.eclipse.californium.elements.util.StringUtil;
 import org.eclipse.californium.extplugtests.resources.Benchmark;
@@ -54,13 +57,24 @@ import org.eclipse.californium.extplugtests.resources.ReverseObserve;
 import org.eclipse.californium.extplugtests.resources.ReverseRequest;
 import org.eclipse.californium.plugtests.AbstractTestServer;
 import org.eclipse.californium.plugtests.PlugtestServer;
+import org.eclipse.californium.plugtests.PlugtestServer.BaseConfig;
 import org.eclipse.californium.plugtests.resources.MyIp;
+import org.eclipse.californium.scandium.DtlsClusterConnector;
+import org.eclipse.californium.scandium.DtlsClusterConnector.ClusterNodesDiscover;
+import org.eclipse.californium.scandium.MdcConnectionListener;
+import org.eclipse.californium.scandium.config.DtlsConnectorConfig;
+import org.eclipse.californium.scandium.dtls.CertificateType;
+import org.eclipse.californium.scandium.dtls.MultiNodeConnectionIdGenerator;
+import org.eclipse.californium.scandium.dtls.cipher.CipherSuite;
+import org.eclipse.californium.scandium.dtls.pskstore.AsyncAdvancedPskStore;
+import org.eclipse.californium.scandium.dtls.x509.AsyncNewAdvancedCertificateVerifier;
 import org.eclipse.californium.unixhealth.NetStatLogger;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
+import picocli.CommandLine.ITypeConverter;
 import picocli.CommandLine.Option;
 import picocli.CommandLine.ParameterException;
 import picocli.CommandLine.ParseResult;
@@ -96,6 +110,7 @@ public class ExtendedTestServer extends AbstractTestServer {
 			config.setInt(Keys.MAX_ACTIVE_PEERS, 2000000);
 			config.setInt(Keys.DTLS_AUTO_RESUME_TIMEOUT, 0);
 			config.setInt(Keys.DTLS_CONNECTION_ID_LENGTH, 6);
+			config.setInt(Keys.DTLS_CONNECTION_ID_NODE_ID, 1);
 			config.setInt(Keys.MAX_PEER_INACTIVITY_PERIOD, 60); // 24h
 			config.setInt(Keys.TCP_CONNECTION_IDLE_TIMEOUT, 60 * 60 * 12); // 12h
 			config.setInt(Keys.TLS_HANDSHAKE_TIMEOUT, 60 * 1000); // 60s
@@ -120,12 +135,24 @@ public class ExtendedTestServer extends AbstractTestServer {
 		@Option(names = "--benchmark", negatable = true, description = "enable benchmark resource.")
 		public boolean benchmark;
 
+		@Option(names = "--dtls-cluster", split = ",", description = "enable DTLS-cluster mode.")
+		public List<Cluster> dtlsClusterNodes;
+
+		@Option(names = "--dtls-cluster-group", split = ",", description = "enable dynamic DTLS-cluster mode.")
+		public List<InetSocketAddress> dtlsClusterGroup;
+
+		public void register(CommandLine cmd) {
+			cmd.registerConverter(Cluster.class, clusterDefinition);
+			cmd.registerConverter(InetSocketAddress.class, addressDefinition);
+		}
+
 	}
 
 	private static final Config config = new Config();
 
 	public static void main(String[] args) {
 		CommandLine cmd = new CommandLine(config);
+		config.register(cmd);
 		try {
 			ParseResult result = cmd.parseArgs(args);
 			if (result.isVersionHelpRequested()) {
@@ -147,8 +174,14 @@ public class ExtendedTestServer extends AbstractTestServer {
 
 		STATISTIC_LOGGER.error("start!");
 		startManagamentStatistic();
-
-		if (config.plugtest) {
+		if (config.dtlsClusterNodes != null) {
+			config.onlyDtls = true;
+			if (config.dtlsClusterGroup != null) {
+				System.out.println("dynamic dtls-cluster!");
+			} else {
+				System.out.println("static dtls-cluster!");
+			}
+		} else if (config.plugtest) {
 			// start standard plugtest server
 			PlugtestServer.start(config);
 		}
@@ -163,7 +196,7 @@ public class ExtendedTestServer extends AbstractTestServer {
 		// create server
 		try {
 			List<Protocol> protocols;
-			
+
 			if (config.onlyDtls) {
 				protocols = Arrays.asList(Protocol.DTLS);
 			} else if (config.tcp) {
@@ -201,12 +234,44 @@ public class ExtendedTestServer extends AbstractTestServer {
 					new NamedThreadFactory("CoapServer(main)#")); //$NON-NLS-1$
 			ScheduledExecutorService secondaryExecutor = ExecutorsUtil
 					.newDefaultSecondaryScheduler("CoapServer(secondary)#");
+
 			ExtendedTestServer server = new ExtendedTestServer(netConfig, protocolConfig, !config.benchmark);
 			server.setExecutors(executor, secondaryExecutor, false);
 			server.add(new ReverseRequest(netConfig, executor));
 			ReverseObserve reverseObserver = new ReverseObserve(netConfig, executor);
 			server.add(reverseObserver);
-			server.addEndpoints(pattern, types, protocols, config);
+
+			if (config.dtlsClusterNodes != null) {
+				ClusterGroup group = null;
+				DtlsClusterConnector.ClusterNodesProvider nodes = null;
+				if (config.dtlsClusterGroup == null) {
+					nodes = new DtlsClusterConnector.ClusterNodesProvider() {
+
+						@Override
+						public InetSocketAddress getClusterNode(int nodeId) {
+							for (Cluster node : config.dtlsClusterNodes) {
+								if (node.nodeid == nodeId) {
+									return node.cluster;
+								}
+							}
+							return null;
+						}
+
+						@Override
+						public boolean available(InetSocketAddress destinationConnector) {
+							return true;
+						}
+					};
+				}
+				for (Cluster cluster : config.dtlsClusterNodes) {
+					if (config.dtlsClusterGroup != null) {
+						group = new ClusterGroup(config.dtlsClusterGroup, cluster.cluster);
+					}
+					server.addClusterEndpoint(config, cluster, secondaryExecutor, nodes, group);
+				}
+			} else {
+				server.addEndpoints(pattern, types, protocols, config);
+			}
 			for (Endpoint ep : server.getEndpoints()) {
 				ep.addNotificationListener(reverseObserver);
 			}
@@ -221,29 +286,31 @@ public class ExtendedTestServer extends AbstractTestServer {
 					ep.addInterceptor(new MessageTracer());
 				}
 				if (ep instanceof MessagePostProcessInterceptors) {
-					int interval = ep.getConfig().getInt(NetworkConfig.Keys.HEALTH_STATUS_INTERVAL);
-					final HealthStatisticLogger healthLogger = new HealthStatisticLogger(uri.getScheme(),
-							!CoAP.isTcpScheme(uri.getScheme()), interval, executor);
-					if (healthLogger.isEnabled()) {
-						((MessagePostProcessInterceptors) ep).addPostProcessInterceptor(healthLogger);
-						ep.addObserver(new EndpointObserver() {
+					if (((MessagePostProcessInterceptors) ep).getPostProcessInterceptors().isEmpty()) {
+						int interval = ep.getConfig().getInt(NetworkConfig.Keys.HEALTH_STATUS_INTERVAL);
+						final HealthStatisticLogger healthLogger = new HealthStatisticLogger(uri.toASCIIString(),
+								!CoAP.isTcpScheme(uri.getScheme()), interval, executor);
+						if (healthLogger.isEnabled()) {
+							((MessagePostProcessInterceptors) ep).addPostProcessInterceptor(healthLogger);
+							ep.addObserver(new EndpointObserver() {
 
-							@Override
-							public void stopped(Endpoint endpoint) {
-								healthLogger.stop();
-							}
+								@Override
+								public void stopped(Endpoint endpoint) {
+									healthLogger.stop();
+								}
 
-							@Override
-							public void started(Endpoint endpoint) {
-								healthLogger.start();
-							}
+								@Override
+								public void started(Endpoint endpoint) {
+									healthLogger.start();
+								}
 
-							@Override
-							public void destroyed(Endpoint endpoint) {
-								healthLogger.stop();
-							}
-						});
-						healthLogger.start();
+								@Override
+								public void destroyed(Endpoint endpoint) {
+									healthLogger.stop();
+								}
+							});
+							healthLogger.start();
+						}
 					}
 				}
 			}
@@ -357,4 +424,166 @@ public class ExtendedTestServer extends AbstractTestServer {
 		}
 	}
 
+	private void addClusterEndpoint(BaseConfig cliConfig, Cluster cluster, ScheduledExecutorService secondaryExecutor,
+			DtlsClusterConnector.ClusterNodesProvider nodesProvider,
+			DtlsClusterConnector.ClusterNodesDiscover nodesDiscoverer) {
+		if (nodesDiscoverer == null ^ nodesProvider != null) {
+			throw new IllegalArgumentException("either nodes-provider or -dicoverer is required!");
+		}
+		NetworkConfig netConfig = getConfig();
+		Integer cidLength = netConfig.getOptInteger(Keys.DTLS_CONNECTION_ID_LENGTH);
+		if (cidLength == null || cidLength < 6) {
+			throw new IllegalArgumentException("cid length must be at least 6 for cluster!");
+		}
+		initCredentials();
+		int retransmissionTimeout = netConfig.getInt(Keys.ACK_TIMEOUT);
+		int staleTimeout = netConfig.getInt(Keys.MAX_PEER_INACTIVITY_PERIOD);
+		int dtlsThreads = netConfig.getInt(Keys.NETWORK_STAGE_SENDER_THREAD_COUNT);
+		int dtlsReceiverThreads = netConfig.getInt(Keys.NETWORK_STAGE_RECEIVER_THREAD_COUNT);
+		int maxPeers = netConfig.getInt(Keys.MAX_ACTIVE_PEERS);
+		int handshakeResultDelay = netConfig.getInt(KEY_DTLS_HANDSHAKE_RESULT_DELAY, 0);
+		Integer healthStatusInterval = netConfig.getOptInteger(Keys.HEALTH_STATUS_INTERVAL); // seconds
+		Integer recvBufferSize = netConfig.getOptInteger(Keys.UDP_CONNECTOR_RECEIVE_BUFFER);
+		Integer sendBufferSize = netConfig.getOptInteger(Keys.UDP_CONNECTOR_SEND_BUFFER);
+		DtlsConnectorConfig.Builder dtlsConfigBuilder = new DtlsConnectorConfig.Builder();
+		dtlsConfigBuilder.setConnectionIdGenerator(new MultiNodeConnectionIdGenerator(cluster.nodeid, cidLength));
+		AsyncAdvancedPskStore asyncPskStore = new AsyncAdvancedPskStore(new PlugPskStore());
+		asyncPskStore.setDelay(handshakeResultDelay);
+		dtlsConfigBuilder.setAdvancedPskStore(asyncPskStore);
+		dtlsConfigBuilder.setAddress(cluster.dtls);
+		dtlsConfigBuilder.setSupportedCipherSuites(CipherSuite.TLS_PSK_WITH_AES_128_CCM_8,
+				CipherSuite.TLS_ECDHE_PSK_WITH_AES_128_CCM_8_SHA256, CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_CCM_8);
+		dtlsConfigBuilder.setIdentity(serverCredentials.getPrivateKey(), serverCredentials.getCertificateChain(),
+				CertificateType.RAW_PUBLIC_KEY, CertificateType.X_509);
+		AsyncNewAdvancedCertificateVerifier.Builder verifierBuilder = AsyncNewAdvancedCertificateVerifier.builder();
+		if (cliConfig.trustall) {
+			verifierBuilder.setTrustAllCertificates();
+		} else {
+			verifierBuilder.setTrustedCertificates(trustedCertificates);
+		}
+		verifierBuilder.setTrustAllRPKs();
+		AsyncNewAdvancedCertificateVerifier verifier = verifierBuilder.build();
+		verifier.setDelay(handshakeResultDelay);
+		dtlsConfigBuilder.setAdvancedCertificateVerifier(verifier);
+		dtlsConfigBuilder.setMaxConnections(maxPeers);
+		dtlsConfigBuilder.setStaleConnectionThreshold(staleTimeout);
+		dtlsConfigBuilder.setConnectionThreadCount(dtlsThreads);
+		dtlsConfigBuilder.setReceiverThreadCount(dtlsReceiverThreads);
+		dtlsConfigBuilder.setHealthStatusInterval(healthStatusInterval);
+		dtlsConfigBuilder.setSocketReceiveBufferSize(recvBufferSize);
+		dtlsConfigBuilder.setSocketSendBufferSize(sendBufferSize);
+		dtlsConfigBuilder.setRetransmissionTimeout(retransmissionTimeout);
+		dtlsConfigBuilder.setConnectionListener(new MdcConnectionListener());
+		dtlsConfigBuilder.setCidUpdateAddressOnNewerRecordFilter(true);
+		dtlsConfigBuilder.setLoggingTag("node-" + cluster.nodeid);
+		CoapEndpoint.Builder builder = new CoapEndpoint.Builder();
+		if (nodesDiscoverer != null) {
+			builder.setConnector(new DtlsClusterConnector(dtlsConfigBuilder.build(), nodesDiscoverer));
+		} else if (nodesProvider != null) {
+			builder.setConnector(new DtlsClusterConnector(dtlsConfigBuilder.build(), nodesProvider));
+		}
+		if (MatcherMode.PRINCIPAL.name().equals(netConfig.getString(Keys.RESPONSE_MATCHING))) {
+			builder.setEndpointContextMatcher(new PrincipalEndpointContextMatcher(true));
+		}
+		builder.setNetworkConfig(netConfig);
+		CoapEndpoint endpoint = builder.build();
+		if (healthStatusInterval != null && endpoint instanceof MessagePostProcessInterceptors) {
+			String tag = CoAP.COAP_SECURE_URI_SCHEME;
+			tag += "-" + cluster.nodeid;
+			final HealthStatisticLogger healthLogger = new HealthStatisticLogger(tag, true, healthStatusInterval,
+					secondaryExecutor);
+			if (healthLogger.isEnabled()) {
+				((MessagePostProcessInterceptors) endpoint).addPostProcessInterceptor(healthLogger);
+				endpoint.addObserver(new EndpointObserver() {
+
+					@Override
+					public void stopped(Endpoint endpoint) {
+						healthLogger.stop();
+					}
+
+					@Override
+					public void started(Endpoint endpoint) {
+						healthLogger.start();
+					}
+
+					@Override
+					public void destroyed(Endpoint endpoint) {
+						healthLogger.stop();
+					}
+				});
+				healthLogger.start();
+			}
+		}
+		addEndpoint(endpoint);
+		InterfaceType interfaceType = cluster.dtls.getAddress().isLoopbackAddress() ? InterfaceType.LOCAL
+				: InterfaceType.EXTERNAL;
+		print(endpoint, interfaceType);
+	}
+
+	private static class ClusterGroup implements ClusterNodesDiscover {
+
+		private final InetSocketAddress discoverInterface;
+		private final List<InetSocketAddress> group;
+
+		private ClusterGroup(List<InetSocketAddress> group, InetSocketAddress discoverInterface) {
+			this.group = group;
+			this.discoverInterface = discoverInterface;
+		}
+
+		@Override
+		public InetSocketAddress getDiscoverInterface() {
+			return discoverInterface;
+		}
+
+		@Override
+		public List<InetSocketAddress> getClusterNodesDiscoverScope() {
+			return group;
+		}
+	}
+
+	private static class Cluster {
+
+		final InetSocketAddress dtls;
+		final InetSocketAddress cluster;
+		final int nodeid;
+
+		private Cluster(String[] args) throws Exception {
+			if (args.length != 3) {
+				throw new IllegalArgumentException(
+						"a cluster definution must contain 3 parts, <dtls-intf>;<mgmt-intf>;nodeid");
+			}
+			dtls = addressDefinition.convert(args[0]);
+			cluster = addressDefinition.convert(args[1]);
+			nodeid = Integer.parseInt(args[2]);
+		}
+	}
+
+	private static ITypeConverter<Cluster> clusterDefinition = new ITypeConverter<Cluster>() {
+
+		@Override
+		public Cluster convert(String value) throws Exception {
+			return new Cluster(value.split(";"));
+		}
+	};
+
+	private static ITypeConverter<InetSocketAddress> addressDefinition = new ITypeConverter<InetSocketAddress>() {
+
+		@Override
+		public InetSocketAddress convert(String value) throws Exception {
+			if (value.startsWith(":")) {
+				// port only => any local address
+				int port = Integer.parseInt(value.substring(1));
+				System.out.println(value + " => <any>:" + port);
+				return new InetSocketAddress(port);
+			} else {
+				// use dummy schema
+				URI uri = new URI("cluster://" + value);
+				String host = uri.getHost();
+				int port = uri.getPort();
+				System.out.println(value + " => " + host + ":" + port);
+				return new InetSocketAddress(host, port);
+			}
+		}
+
+	};
 }
