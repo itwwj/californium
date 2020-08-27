@@ -113,7 +113,7 @@ public class DefaultCipherSuiteSelector implements CipherSuiteSelector {
 							parameters.getCertificateChain());
 				}
 				if (!supported) {
-					// x509 is not supported, because the certificat chain
+					// x509 is not supported, because the certificate chain
 					// contains unsupported signature hashs algorithms or groups
 					// (curves).
 					if (parameters.getServerCertTypes().contains(CertificateType.RAW_PUBLIC_KEY)) {
